@@ -1,6 +1,6 @@
 package kvstore
 
-import akka.actor.{ OneForOneStrategy, Props, ActorRef, Actor }
+import akka.actor.{ OneForOneStrategy, Props, ActorRef, Actor, Cancellable }
 import kvstore.Arbiter._
 import scala.collection.immutable.Queue
 import akka.actor.SupervisorStrategy.Restart
@@ -40,6 +40,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
 
+  val system = context.system
+  val persistence = system.actorOf(persistenceProps)
 
   override def preStart() = {
     arbiter ! Join
@@ -80,20 +82,31 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   /* TODO Behavior for the replica role. */
   val replica: Receive = getReceive orElse {
-    case Snapshot(key, valueOption, seq) =>
+    case s@Snapshot(key, valueOption, seq) =>
       if (seq == _seqCounter) {
         incSeq()
         valueOption match {
           case Some(value) =>
             kv = kv + (key -> value)
-            sender ! SnapshotAck(key, seq)
           case None =>
             kv = kv - key
-            sender() ! SnapshotAck(key, seq)
         }
+        val retryPersist = system.scheduler.schedule(0.seconds, 100.milliseconds) {
+          persistence ! Persist(key, valueOption, seq)
+        }
+        context.become(awaitPersistance(s, sender(), retryPersist))
       } else if (seq < _seqCounter) {
         sender ! SnapshotAck(key, seq)
       }
+
+    case _ =>
+  }
+
+  def awaitPersistance(snapshot: Snapshot, repl: ActorRef, retry: Cancellable): Receive = getReceive orElse {
+    case Persisted(key, id) =>
+      retry.cancel()
+      repl ! SnapshotAck(snapshot.key, snapshot.seq)
+      context.become(replica)
     case _ =>
   }
 }
