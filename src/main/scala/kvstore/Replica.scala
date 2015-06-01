@@ -68,16 +68,39 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case JoinedSecondary => context.become(replica)
   }
 
+  def retryTask(key: String, valueOption: Option[String], id: Long) = system.scheduler.schedule(0.seconds, 100.milliseconds) {
+    persistence ! Persist(key, valueOption, id)
+  }
+
+  def failedTask(id: Long) = system.scheduler.scheduleOnce(1.second) {
+    self ! OperationFailed(id)
+  }
+
   /* TODO Behavior for  the leader role. */
   val leader: Receive = getReceive orElse {
-
     case Insert(key, value, id) =>
       kv = kv + (key -> value)
-      sender ! OperationAck(id)
+      val retry = retryTask(key, Option(value), id)
+      val failedScheduler = failedTask(id)
+      replicators foreach {repl => repl ! Replicate(key, Option(value), id)}
+      context.become(leaderAwaitPersistance(sender(), retry, failedScheduler, replicators, false))
     case Remove(key, id) =>
       kv = kv - key
-      sender ! OperationAck(id)
-    case _ =>
+      val retry = retryTask(key, None, id)
+      val failedScheduler = failedTask(id)
+      replicators foreach {repl => repl ! Replicate(key, None, id)}
+      context.become(leaderAwaitPersistance(sender(), retry, failedScheduler, replicators, false))
+    case Replicas(replicas) =>
+      replicas.filterNot(ref => ref.equals(self)) foreach { secondary =>
+        secondaries.get(secondary) match {
+          case None =>
+            val replicator = system.actorOf(Props(classOf[Replicator], secondary))
+            replicators += replicator
+            secondaries += (secondary -> replicator)
+          case _ =>
+        }
+      }
+    case m@_ => println(m)
   }
 
   /* TODO Behavior for the replica role. */
@@ -94,7 +117,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         val retryPersist = system.scheduler.schedule(0.seconds, 100.milliseconds) {
           persistence ! Persist(key, valueOption, seq)
         }
-        context.become(awaitPersistance(s, sender(), retryPersist))
+        context.become(replicaAwaitPersistance(s, sender(), retryPersist))
       } else if (seq < _seqCounter) {
         sender ! SnapshotAck(key, seq)
       }
@@ -102,12 +125,43 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case _ =>
   }
 
-  def awaitPersistance(snapshot: Snapshot, repl: ActorRef, retry: Cancellable): Receive = getReceive orElse {
+  def replicaAwaitPersistance(snapshot: Snapshot, repl: ActorRef, retry: Cancellable): Receive = getReceive orElse {
     case Persisted(key, id) =>
       retry.cancel()
       repl ! SnapshotAck(snapshot.key, snapshot.seq)
       context.become(replica)
     case _ =>
+  }
+
+  def leaderAwaitPersistance(client: ActorRef, 
+                             retryTask: Cancellable, 
+                             failedTask: Cancellable,
+                             waitSecondaries: Set[ActorRef],
+                             isPrimaryPersisted: Boolean): Receive = getReceive orElse {
+    case Persisted(key, id) =>
+      if (waitSecondaries.isEmpty) {
+        retryTask.cancel()
+        failedTask.cancel()
+        client ! OperationAck(id)
+        context.become(leader)
+      } else {
+        context.become(leaderAwaitPersistance(client, retryTask, failedTask, waitSecondaries, true))
+      }
+    case Replicated(key, id) =>
+      val set = waitSecondaries - sender
+      if (set.isEmpty && isPrimaryPersisted) {
+        retryTask.cancel()
+        failedTask.cancel()
+        client ! OperationAck(id)
+        context.become(leader)
+      } else {
+        context.become(leaderAwaitPersistance(client, retryTask, failedTask, set, isPrimaryPersisted))
+      }
+    case OperationFailed(id) =>
+      retryTask.cancel()
+      client ! OperationFailed(id)
+      context.become(leader)
+    case m@_ => println(m)
   }
 }
 

@@ -24,16 +24,16 @@ class Replicator(val replica: ActorRef) extends Actor {
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
 
+  // map from sequence number to pair of sender and request
+  var acks = Map.empty[Long, (ActorRef, Replicate)]
+  // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
+  var pending = Vector.empty[Snapshot]
+
   context.system.scheduler.schedule(0.seconds, 100.milliseconds) {
     acks.foreach { case (seq, (_, Replicate(key, valueOption, id))) =>
       replica ! Snapshot(key, valueOption, seq)
     }
   }
-
-  // map from sequence number to pair of sender and request
-  var acks = Map.empty[Long, (ActorRef, Replicate)]
-  // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
-  var pending = Vector.empty[Snapshot]
   
   var _seqCounter = 0L
   def nextSeq = {
