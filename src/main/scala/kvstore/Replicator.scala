@@ -29,12 +29,16 @@ class Replicator(val replica: ActorRef) extends Actor {
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
   var pending = Vector.empty[Snapshot]
 
-  context.system.scheduler.schedule(0.seconds, 100.milliseconds) {
+  val task = context.system.scheduler.schedule(0.seconds, 100.milliseconds) {
     acks.foreach { case (seq, (_, Replicate(key, valueOption, id))) =>
       replica ! Snapshot(key, valueOption, seq)
     }
   }
-  
+
+  override def postStop(): Unit = {
+    task.cancel()
+  }
+
   var _seqCounter = 0L
   def nextSeq = {
     val ret = _seqCounter

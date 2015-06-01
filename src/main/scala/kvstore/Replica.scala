@@ -83,7 +83,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   def failedTask(id: Long) = system.scheduler.scheduleOnce(1.second, self, PersistTimeout(id))
 
   def persist(key: String, valueOpt: Option[String], id: Long): Unit = {
-    println("persist id = " + id)
     persistAcks += id -> sender()
 
     val retry = retryTask(key, valueOpt, id)
