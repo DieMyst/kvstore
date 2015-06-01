@@ -1,39 +1,40 @@
 package kvstore
 
-import akka.actor.{ OneForOneStrategy, Props, ActorRef, Actor, Cancellable }
+import akka.actor.{Actor, ActorRef, Cancellable, PoisonPill, Props}
 import kvstore.Arbiter._
-import scala.collection.immutable.Queue
-import akka.actor.SupervisorStrategy.Restart
-import scala.annotation.tailrec
-import akka.pattern.{ ask, pipe }
-import akka.actor.Terminated
+
 import scala.concurrent.duration._
-import akka.actor.PoisonPill
-import akka.actor.OneForOneStrategy
-import akka.actor.SupervisorStrategy
-import akka.util.Timeout
 
 object Replica {
+
   sealed trait Operation {
     def key: String
+
     def id: Long
   }
+
   case class Insert(key: String, value: String, id: Long) extends Operation
+
   case class Remove(key: String, id: Long) extends Operation
+
   case class Get(key: String, id: Long) extends Operation
 
   sealed trait OperationReply
+
   case class OperationAck(id: Long) extends OperationReply
+
   case class OperationFailed(id: Long) extends OperationReply
+
   case class GetResult(key: String, valueOption: Option[String], id: Long) extends OperationReply
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
+
+  import Persistence._
   import Replica._
   import Replicator._
-  import Persistence._
   import context.dispatcher
 
   /*
@@ -48,6 +49,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   }
 
   var _seqCounter = 0L
+
   def incSeq() = {
     _seqCounter += 1
   }
@@ -64,7 +66,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   }
 
   def receive = {
-    case JoinedPrimary   => context.become(leader)
+    case JoinedPrimary => context.become(leader)
     case JoinedSecondary => context.become(replica)
   }
 
@@ -82,22 +84,31 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       kv = kv + (key -> value)
       val retry = retryTask(key, Option(value), id)
       val failedScheduler = failedTask(id)
-      replicators foreach {repl => repl ! Replicate(key, Option(value), id)}
+      replicators foreach { repl => repl ! Replicate(key, Option(value), id) }
       context.become(leaderAwaitPersistance(sender(), retry, failedScheduler, replicators, false))
     case Remove(key, id) =>
       kv = kv - key
       val retry = retryTask(key, None, id)
       val failedScheduler = failedTask(id)
-      replicators foreach {repl => repl ! Replicate(key, None, id)}
+      replicators foreach { repl => repl ! Replicate(key, None, id) }
       context.become(leaderAwaitPersistance(sender(), retry, failedScheduler, replicators, false))
     case Replicas(replicas) =>
-      replicas.filterNot(ref => ref.equals(self)) foreach { secondary =>
-        secondaries.get(secondary) match {
-          case None =>
-            val replicator = system.actorOf(Props(classOf[Replicator], secondary))
-            replicators += replicator
-            secondaries += (secondary -> replicator)
-          case _ =>
+      val allSecondary = replicas.filterNot(_ == self)
+      val newSecondary = allSecondary -- secondaries.keySet
+      val secondaryToDelete = secondaries.keySet -- allSecondary
+
+      secondaryToDelete foreach { repl =>
+        repl ! PoisonPill
+        secondaries(repl) ! PoisonPill
+        secondaries = secondaries - repl
+      }
+
+      newSecondary foreach { secondary =>
+        val replicator = system.actorOf(Props(classOf[Replicator], secondary))
+        replicators += replicator
+        secondaries += (secondary -> replicator)
+        kv.zipWithIndex foreach { case ((key, value), id) =>
+          replicator ! Replicate(key, Option(value), id)
         }
       }
     case m@_ => println(m)
@@ -133,8 +144,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case _ =>
   }
 
-  def leaderAwaitPersistance(client: ActorRef, 
-                             retryTask: Cancellable, 
+  def leaderAwaitPersistance(client: ActorRef,
+                             retryTask: Cancellable,
                              failedTask: Cancellable,
                              waitSecondaries: Set[ActorRef],
                              isPrimaryPersisted: Boolean): Receive = getReceive orElse {
