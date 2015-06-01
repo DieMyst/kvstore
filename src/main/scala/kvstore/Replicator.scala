@@ -24,6 +24,12 @@ class Replicator(val replica: ActorRef) extends Actor {
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
 
+  context.system.scheduler.schedule(0.seconds, 100.milliseconds) {
+    acks.foreach { case (seq, (_, Replicate(key, valueOption, id))) =>
+      replica ! Snapshot(key, valueOption, seq)
+    }
+  }
+
   // map from sequence number to pair of sender and request
   var acks = Map.empty[Long, (ActorRef, Replicate)]
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
@@ -39,6 +45,17 @@ class Replicator(val replica: ActorRef) extends Actor {
   
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
+    case r@Replicate(key, valueOption, id) =>
+      val seq = nextSeq
+      replica ! Snapshot(key, valueOption, seq)
+      acks += (seq -> (sender(), r))
+    case SnapshotAck(key, seq) =>
+      acks.get(seq) match {
+        case Some((ref, Replicate(_, _, id))) =>
+          ref ! Replicated(key, id)
+          acks -= seq
+        case None =>
+      }
     case _ =>
   }
 
