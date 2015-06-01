@@ -27,6 +27,8 @@ object Replica {
 
   case class GetResult(key: String, valueOption: Option[String], id: Long) extends OperationReply
 
+  case class PersistTimeout(id: Long)
+
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
 
@@ -60,6 +62,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
 
+  var persistAcks = Map.empty[Long, ActorRef]
+  var replicateAcks = Map.empty[Long, Set[ActorRef]]
+  var retryTasks = Map.empty[Long, Cancellable]
+  var failedTasks = Map.empty[Long, Cancellable]
+
   val getReceive: Receive = {
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
@@ -70,28 +77,45 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case JoinedSecondary => context.become(replica)
   }
 
-  def retryTask(key: String, valueOption: Option[String], id: Long) = system.scheduler.schedule(0.seconds, 100.milliseconds) {
-    persistence ! Persist(key, valueOption, id)
+  def retryTask(key: String, valueOption: Option[String], id: Long) =
+    system.scheduler.schedule(0.seconds, 100.milliseconds, persistence, Persist(key, valueOption, id))
+
+  def failedTask(id: Long) = system.scheduler.scheduleOnce(1.second, self, PersistTimeout(id))
+
+  def persist(key: String, valueOpt: Option[String], id: Long): Unit = {
+    println("persist id = " + id)
+    persistAcks += id -> sender()
+
+    val retry = retryTask(key, valueOpt, id)
+    retryTasks += id -> retry
+
+    val failedScheduler = failedTask(id)
+    failedTasks += id -> failedScheduler
+
+    if (replicators.nonEmpty) {
+      replicators foreach { repl => repl ! Replicate(key, valueOpt, id) }
+      replicateAcks += id -> Set(replicators.toArray:_*)
+    }
   }
 
-  def failedTask(id: Long) = system.scheduler.scheduleOnce(1.second) {
-    self ! OperationFailed(id)
+  def checkPersist(id: Long): Unit = {
+    if (retryTasks.get(id).isEmpty && replicateAcks.get(id).isEmpty) {
+      failedTasks.get(id) foreach (_.cancel())
+      failedTasks -= id
+
+      persistAcks.get(id) foreach (_ ! OperationAck(id))
+      persistAcks -= id
+    }
   }
 
   /* TODO Behavior for  the leader role. */
   val leader: Receive = getReceive orElse {
     case Insert(key, value, id) =>
       kv = kv + (key -> value)
-      val retry = retryTask(key, Option(value), id)
-      val failedScheduler = failedTask(id)
-      replicators foreach { repl => repl ! Replicate(key, Option(value), id) }
-      context.become(leaderAwaitPersistance(sender(), retry, failedScheduler, replicators, false))
+      persist(key, Option(value), id)
     case Remove(key, id) =>
       kv = kv - key
-      val retry = retryTask(key, None, id)
-      val failedScheduler = failedTask(id)
-      replicators foreach { repl => repl ! Replicate(key, None, id) }
-      context.become(leaderAwaitPersistance(sender(), retry, failedScheduler, replicators, false))
+      persist(key, None, id)
     case Replicas(replicas) =>
       val allSecondary = replicas.filterNot(_ == self)
       val newSecondary = allSecondary -- secondaries.keySet
@@ -99,8 +123,18 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
       secondaryToDelete foreach { repl =>
         repl ! PoisonPill
+
+        val replicator = secondaries(repl)
         secondaries(repl) ! PoisonPill
         secondaries = secondaries - repl
+
+        val ids = replicateAcks.keySet
+
+        replicateAcks = replicateAcks.map { case (id, set) =>
+          id -> (set - replicator)
+        }.filter{case (id, set) => set.nonEmpty}
+
+        ids.foreach(checkPersist)
       }
 
       newSecondary foreach { secondary =>
@@ -111,6 +145,32 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
           replicator ! Replicate(key, Option(value), id)
         }
       }
+
+    case Persisted(key, id) =>
+      retryTasks.get(id) foreach (_.cancel())
+      retryTasks -= id
+      checkPersist(id)
+    case Replicated(key, id) =>
+      if (replicateAcks.contains(id)){
+        val newSet = replicateAcks(id) - sender()
+        if(newSet.isEmpty) {
+          replicateAcks -= id
+          checkPersist(id)
+        } else {
+          replicateAcks += id -> newSet
+        }
+      }
+    case PersistTimeout(id) =>
+      retryTasks.get(id) foreach (_.cancel())
+      retryTasks -= id
+      failedTasks -= id
+      replicateAcks -= id
+
+      val clOpt = persistAcks.get(id)
+      persistAcks -= id
+
+      clOpt foreach(_ ! OperationFailed(id))
+
     case m@_ => println(m)
   }
 
